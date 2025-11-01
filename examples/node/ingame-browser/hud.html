@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Voice Overlay Assistant</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: rgba(12, 14, 20, 0.9);
+        color: #f8f9fb;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0;
+      }
+      button {
+        padding: 10px 16px;
+        border-radius: 8px;
+        border: none;
+        font-size: 1rem;
+        font-weight: 600;
+        background: #4f46e5;
+        color: #fff;
+        cursor: pointer;
+        transition: background 0.2s ease;
+      }
+      button[disabled] {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+      button:hover:not([disabled]) {
+        background: #4338ca;
+      }
+      #status {
+        min-height: 1.4rem;
+        font-size: 0.95rem;
+        color: #a5b4fc;
+      }
+      #conversation {
+        flex: 1;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 12px;
+        border-radius: 12px;
+        background: rgba(22, 24, 33, 0.86);
+        backdrop-filter: blur(6px);
+        border: 1px solid rgba(79, 70, 229, 0.32);
+      }
+      .message {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: rgba(30, 32, 42, 0.92);
+      }
+      .message.assistant {
+        border-left: 4px solid #38bdf8;
+      }
+      .message.user {
+        border-left: 4px solid #f97316;
+      }
+      .message strong {
+        font-size: 0.85rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: rgba(226, 232, 240, 0.78);
+      }
+      .message span {
+        white-space: pre-wrap;
+        font-size: 0.95rem;
+      }
+      footer {
+        font-size: 0.8rem;
+        color: rgba(226, 232, 240, 0.65);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Overlay Voice Agent</h1>
+      <button id="record-btn" disabled>Start Recording</button>
+    </header>
+    <div id="status"></div>
+    <section id="conversation"></section>
+    <footer>
+      Press <strong>Shift + A</strong> to toggle HUD interaction. When passive, clicks go to the game underneath.
+    </footer>
+    <script>
+      const { ipcRenderer } = require('electron');
+      const { Buffer } = require('buffer');
+      const recordBtn = document.getElementById('record-btn');
+      const statusEl = document.getElementById('status');
+      const conversationEl = document.getElementById('conversation');
+
+      let mediaRecorder = null;
+      let audioChunks = [];
+      const history = [];
+      let hudInteractive = false;
+
+      function appendMessage(role, text) {
+        const messageEl = document.createElement('div');
+        messageEl.className = `message ${role}`;
+        const roleEl = document.createElement('strong');
+        roleEl.textContent = role === 'assistant' ? 'Assistant' : 'You';
+        const textEl = document.createElement('span');
+        textEl.textContent = text;
+        messageEl.appendChild(roleEl);
+        messageEl.appendChild(textEl);
+        conversationEl.appendChild(messageEl);
+        conversationEl.scrollTop = conversationEl.scrollHeight;
+      }
+
+      function setStatus(text) {
+        statusEl.textContent = text ?? '';
+      }
+
+      async function processRecording(blob) {
+        try {
+          setStatus('Sending audio to assistant...');
+          const arrayBuffer = await blob.arrayBuffer();
+          const base64Audio = Buffer.from(arrayBuffer).toString('base64');
+          const payload = {
+            audioBase64: base64Audio,
+            mimeType: blob.type || 'audio/webm',
+            history,
+          };
+          const result = await ipcRenderer.invoke('voice:process', payload);
+          if (!result) {
+            throw new Error('Voice processing failed');
+          }
+
+          if (result.transcript) {
+            history.push({ role: 'user', content: result.transcript });
+            appendMessage('user', result.transcript);
+          }
+
+          if (result.responseText) {
+            history.push({ role: 'assistant', content: result.responseText });
+            appendMessage('assistant', result.responseText);
+          }
+
+          if (result.voiceBase64) {
+            const audio = new Audio(`data:audio/mpeg;base64,${result.voiceBase64}`);
+            audio.play().catch(() => {
+              console.warn('Failed to play response audio');
+            });
+          }
+
+          setStatus(hudInteractive ? 'HUD active. Ask another question.' : 'HUD passive. Press Shift + A to interact.');
+        } catch (error) {
+          console.error(error);
+          setStatus(error.message ?? 'An unexpected error occurred.');
+        }
+      }
+
+      async function toggleRecording() {
+        if (!hudInteractive) {
+          return;
+        }
+
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            mediaRecorder.ondataavailable = (event) => {
+              if (event.data.size > 0) {
+                audioChunks.push(event.data);
+              }
+            };
+            mediaRecorder.onstop = async () => {
+              const blob = new Blob(audioChunks, { type: 'audio/webm' });
+              stream.getTracks().forEach(track => track.stop());
+              recordBtn.disabled = true;
+              await processRecording(blob);
+              recordBtn.disabled = !hudInteractive;
+            };
+            mediaRecorder.start();
+            setStatus('Recording... click again to stop.');
+            recordBtn.textContent = 'Stop Recording';
+          } catch (error) {
+            console.error(error);
+            setStatus('Microphone access denied or unavailable.');
+          }
+        } else {
+          mediaRecorder.stop();
+          recordBtn.textContent = 'Start Recording';
+          setStatus('Processing your audio...');
+        }
+      }
+
+      recordBtn.addEventListener('click', () => {
+        void toggleRecording();
+      });
+
+      ipcRenderer.on('hud:interaction', (_event, enabled) => {
+        hudInteractive = Boolean(enabled);
+        recordBtn.disabled = !hudInteractive;
+
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+          return;
+        }
+
+        setStatus(hudInteractive ? 'HUD active. Click the record button to talk.' : 'HUD passive. Press Shift + A to interact.');
+      });
+
+      appendMessage('assistant', 'I am hovering above your screen. Press Shift plus A to make me clickable, then hit Start Recording.');
+      setStatus('HUD passive. Press Shift + A to interact.');
+    </script>
+  </body>
+</html>

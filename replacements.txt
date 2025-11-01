@@ -1,0 +1,23 @@
+     # openai
+     literal:sk-proj-..............................................
+     OPENAI_API_KEY_REDACTED
+     # elevenlabs
+     literal:sk_...................................................
+     ELEVENLABS_API_KEY_REDACTED
+     # voice id (optional, if you consider it sensitive)
+     literal:21m00Tcm4TlvDq8ikWAM
+     ELEVENLABS_VOICE_ID_REDACTED
+     ```
+     (Use the exact leaked strings on the `literal:` lines—do not commit this file.)
+  3. Run:
+     ```
+     git filter-repo --replace-text replacements.txt --force
+     ```
+  4. Delete `replacements.txt`, then `git gc --prune=now`.
+- **Force-push sanitized history:** Coordinate with collaborators, then run  
+  `git push --force --prune originozgur <branch-name>` (and repeat for any other remotes/branches).
+- **Invalidate cached copies:** Ask teammates to reclone; consider deleting any GitHub/GitLab release assets or archived bundles created before the rewrite.
+
+## Follow-up
+- Existing TypeScript lints (unrelated to today’s edit) still report on `examples/node/ingame-browser/main/index.ts`; address them when convenient.
+- After rotating keys, run the app with the new `.env` values to confirm everything still works.

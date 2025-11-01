@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Voice Overlay Assistant</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: rgba(12, 14, 20, 0.9);
+        color: #f8f9fb;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+      }
+      h1 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin: 0;
+      }
+      button {
+        padding: 10px 16px;
+        border-radius: 8px;
+        border: none;
+        font-size: 1rem;
+        font-weight: 600;
+        background: #4f46e5;
+        color: #fff;
+        cursor: pointer;
+        transition: background 0.2s ease;
+      }
+      button[disabled] {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+      button:hover:not([disabled]) {
+        background: #4338ca;
+      }
+      #status {
+        min-height: 1.4rem;
+        font-size: 0.95rem;
+        color: #a5b4fc;
+      }
+      #conversation {
+        flex: 1;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 12px;
+        border-radius: 12px;
+        background: rgba(22, 24, 33, 0.86);
+        backdrop-filter: blur(6px);
+        border: 1px solid rgba(79, 70, 229, 0.32);
+      }
+      #screenshots {
+        max-height: 320px;
+        overflow: auto;
+        margin-top: 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(79, 70, 229, 0.32);
+        padding: 12px;
+        background: rgba(12, 14, 20, 0.72);
+      }
+      #screenshots h2 {
+        margin: 0 0 8px;
+        font-size: 1rem;
+        font-weight: 600;
+        color: #a5b4fc;
+      }
+      #screenshot-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 8px;
+      }
+      #screenshot-grid img {
+        width: 100%;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 255, 0.35);
+        background: rgba(30, 32, 42, 0.82);
+        object-fit: cover;
+      }
+      #continuous-indicator {
+        padding: 8px 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(74, 222, 128, 0.45);
+        background: rgba(15, 118, 110, 0.25);
+        color: rgba(190, 242, 100, 0.9);
+        font-size: 0.85rem;
+        font-weight: 500;
+        display: none;
+      }
+      #continuous-indicator[hidden] {
+        display: none;
+      }
+      .message {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: rgba(30, 32, 42, 0.92);
+      }
+      .message.assistant {
+        border-left: 4px solid #38bdf8;
+      }
+      .message.user {
+        border-left: 4px solid #f97316;
+      }
+      .message strong {
+        font-size: 0.85rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: rgba(226, 232, 240, 0.78);
+      }
+      .message span {
+        white-space: pre-wrap;
+        font-size: 0.95rem;
+      }
+      footer {
+        font-size: 0.8rem;
+        color: rgba(226, 232, 240, 0.65);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Overlay Voice Agent</h1>
+      <button id="record-btn" disabled>Start Recording</button>
+    </header>
+    <div id="status"></div>
+    <section id="conversation"></section>
+    <div id="continuous-indicator" hidden>
+      Continuous listening active — speech will auto-send when silence detected.
+    </div>
+    <section id="screenshots">
+      <h2>Captured Screenshots</h2>
+      <div id="screenshot-grid"></div>
+    </section>
+    <footer>
+      Press <strong>Shift + A</strong> to toggle HUD interaction. When passive, clicks go to the game underneath.
+    </footer>
+    <script>
+      const { ipcRenderer } = require('electron');
+      const { Buffer } = require('buffer');
+      const recordBtn = document.getElementById('record-btn');
+      const statusEl = document.getElementById('status');
+      const conversationEl = document.getElementById('conversation');
+      const screenshotGrid = document.getElementById('screenshot-grid');
+      const continuousIndicator = document.getElementById('continuous-indicator');
+
+      let mediaRecorder = null;
+      let audioChunks = [];
+      const history = [];
+      let hudInteractive = false;
+      let overlayInteractive = false;
+      let isPttActive = false;
+      let continuousMode = false;
+      let continuousStream = null;
+      let continuousAudioContext = null;
+      let continuousAnalyser = null;
+      let continuousDataArray = null;
+      let continuousMonitorTimer = null;
+      let continuousRecorder = null;
+      let continuousChunks = [];
+      let continuousFinalizing = false;
+      let continuousSegmentStartAt = 0;
+      let continuousLastSpeechAt = 0;
+
+      const CONTINUOUS_SILENCE_THRESHOLD = 0.015;
+      const CONTINUOUS_SILENCE_TIMEOUT_MS = 1200;
+      const CONTINUOUS_MAX_SEGMENT_MS = 15000;
+
+      function appendMessage(role, text) {
+        const messageEl = document.createElement('div');
+        messageEl.className = `message ${role}`;
+        const roleEl = document.createElement('strong');
+        roleEl.textContent = role === 'assistant' ? 'Assistant' : 'You';
+        const textEl = document.createElement('span');
+        textEl.textContent = text;
+        messageEl.appendChild(roleEl);
+        messageEl.appendChild(textEl);
+        conversationEl.appendChild(messageEl);
+        conversationEl.scrollTop = conversationEl.scrollHeight;
+      }
+
+      function setStatus(text) {
+        statusEl.textContent = text ?? '';
+      }
+
+      function setContinuousIndicator(active) {
+        if (!continuousIndicator) {
+          return;
+        }
+
+        if (active) {
+          continuousIndicator.hidden = false;
+          return;
+        }
+
+        continuousIndicator.hidden = true;
+      }
+
+      async function processRecording(blob) {
+        try {
+          setStatus('Sending audio to assistant...');
+          const arrayBuffer = await blob.arrayBuffer();
+          const base64Audio = Buffer.from(arrayBuffer).toString('base64');
+          const payload = {
+            audioBase64: base64Audio,
+            mimeType: blob.type || 'audio/webm',
+            history,
+          };
+          const result = await ipcRenderer.invoke('voice:process', payload);
+          if (!result) {
+            throw new Error('Voice processing failed');
+          }
+
+          if (result.transcript) {
+            history.push({ role: 'user', content: result.transcript });
+            appendMessage('user', result.transcript);
+          }
+
+          if (result.responseText) {
+            history.push({ role: 'assistant', content: result.responseText });
+            appendMessage('assistant', result.responseText);
+          }
+
+          if (result.voiceBase64) {
+            const audio = new Audio(`data:audio/mpeg;base64,${result.voiceBase64}`);
+            audio.play().catch(() => {
+              console.warn('Failed to play response audio');
+            });
+          }
+
+          if (Array.isArray(result.screenshots)) {
+            screenshotGrid.innerHTML = '';
+            for (const frame of result.screenshots) {
+              if (!frame?.dataUrl) {
+                continue;
+              }
+              const img = document.createElement('img');
+              img.src = frame.dataUrl;
+              img.alt = `Screenshot captured at ${frame.capturedAt ?? ''}`;
+              screenshotGrid.appendChild(img);
+            }
+
+            if (result.screenshots.length === 0) {
+              const empty = document.createElement('p');
+              empty.textContent = 'No screenshots captured for this request.';
+              empty.style.color = 'rgba(226, 232, 240, 0.65)';
+              screenshotGrid.appendChild(empty);
+            }
+          }
+
+          setStatus(hudInteractive ? 'HUD active. Ask another question.' : 'HUD passive. Press Shift + A to interact.');
+        } catch (error) {
+          console.error(error);
+          setStatus(error.message ?? 'An unexpected error occurred.');
+        }
+      }
+
+      async function toggleRecording() {
+        if (!hudInteractive) {
+          return;
+        }
+
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            mediaRecorder.ondataavailable = (event) => {
+              if (event.data.size > 0) {
+                audioChunks.push(event.data);
+              }
+            };
+            mediaRecorder.onstop = async () => {
+              const blob = new Blob(audioChunks, { type: 'audio/webm' });
+              stream.getTracks().forEach(track => track.stop());
+              recordBtn.disabled = true;
+              await processRecording(blob);
+              recordBtn.disabled = !hudInteractive;
+            };
+            mediaRecorder.start();
+            setStatus('Recording... click again to stop.');
+            recordBtn.textContent = 'Stop Recording';
+          } catch (error) {
+            console.error(error);
+            setStatus('Microphone access denied or unavailable.');
+          }
+        } else {
+          mediaRecorder.stop();
+          recordBtn.textContent = 'Start Recording';
+          setStatus('Processing your audio...');
+        }
+      }
+
+      function handlePushToTalkToggle(active, statusText) {
+        isPttActive = active;
+
+        if (isPttActive) {
+          hudInteractive = true;
+          recordBtn.disabled = false;
+
+          if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+            void toggleRecording();
+          }
+
+          if (statusText) {
+            setStatus(statusText);
+          }
+
+          return;
+        }
+
+        hudInteractive = overlayInteractive;
+        recordBtn.disabled = !hudInteractive;
+
+        if (mediaRecorder?.state === 'recording') {
+          mediaRecorder.stop();
+          recordBtn.textContent = 'Start Recording';
+        }
+
+        if (statusText) {
+          setStatus(statusText);
+          return;
+        }
+
+        setStatus(hudInteractive ? 'HUD active. Click the record button to talk.' : 'Overlay hidden. Press Shift + Z to speak.');
+      }
+
+      async function handleContinuousToggle(active, statusText) {
+        continuousMode = active;
+        setContinuousIndicator(continuousMode);
+
+        if (statusText) {
+          setStatus(statusText);
+        }
+
+        if (continuousMode) {
+          await startContinuousCapture();
+          return;
+        }
+
+        await stopContinuousCapture();
+      }
+
+      function cleanupContinuousResources() {
+        continuousMonitorTimer && clearInterval(continuousMonitorTimer);
+        continuousMonitorTimer = null;
+
+        continuousAnalyser?.disconnect();
+        continuousAnalyser = null;
+
+        continuousAudioContext?.close().catch(() => {});
+        continuousAudioContext = null;
+
+        continuousStream?.getTracks().forEach(track => track.stop());
+        continuousStream = null;
+
+        continuousRecorder = null;
+        continuousChunks = [];
+        continuousFinalizing = false;
+      }
+
+      function scheduleContinuousMonitor() {
+        continuousMonitorTimer && clearInterval(continuousMonitorTimer);
+
+        continuousMonitorTimer = setInterval(() => {
+          if (!continuousMode || !continuousAnalyser || !continuousDataArray || !continuousRecorder) {
+            return;
+          }
+
+          continuousAnalyser.getFloatTimeDomainData(continuousDataArray);
+
+          let rms = 0;
+          for (let i = 0; i < continuousDataArray.length; i++) {
+            const sample = continuousDataArray[i];
+            rms += sample * sample;
+          }
+          rms = Math.sqrt(rms / continuousDataArray.length);
+
+          const now = Date.now();
+
+          if (rms > CONTINUOUS_SILENCE_THRESHOLD) {
+            continuousLastSpeechAt = now;
+          }
+
+          const elapsedSinceSpeech = now - continuousLastSpeechAt;
+          const segmentDuration = now - continuousSegmentStartAt;
+
+          if (
+            !continuousFinalizing &&
+            ((elapsedSinceSpeech > CONTINUOUS_SILENCE_TIMEOUT_MS && segmentDuration > 1000) ||
+              segmentDuration > CONTINUOUS_MAX_SEGMENT_MS)
+          ) {
+            finalizeContinuousSegment();
+          }
+        }, 250);
+      }
+
+      async function startContinuousCapture() {
+        if (continuousRecorder || continuousFinalizing) {
+          return;
+        }
+
+        try {
+          continuousStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          if (!continuousStream) {
+            setContinuousIndicator(false);
+            setStatus('Unable to access microphone for continuous capture.');
+            return;
+          }
+
+          continuousAudioContext = new AudioContext();
+          const source = continuousAudioContext.createMediaStreamSource(continuousStream);
+          continuousAnalyser = continuousAudioContext.createAnalyser();
+          continuousAnalyser.fftSize = 2048;
+          const bufferLength = continuousAnalyser.fftSize;
+          continuousDataArray = new Float32Array(bufferLength);
+
+          source.connect(continuousAnalyser);
+
+          continuousRecorder = new MediaRecorder(continuousStream, { mimeType: 'audio/webm' });
+          continuousChunks = [];
+          continuousFinalizing = false;
+          continuousSegmentStartAt = Date.now();
+          continuousLastSpeechAt = Date.now();
+
+          continuousRecorder.ondataavailable = event => {
+            if (event.data.size > 0) {
+              continuousChunks.push(event.data);
+            }
+          };
+
+          continuousRecorder.onstop = async () => {
+            if (continuousChunks.length === 0) {
+              cleanupContinuousResources();
+              return;
+            }
+
+            const segmentBlob = new Blob(continuousChunks, { type: 'audio/webm' });
+            continuousChunks = [];
+
+            await processContinuousSegment(segmentBlob);
+
+            if (continuousMode) {
+              continuousFinalizing = false;
+              continuousSegmentStartAt = Date.now();
+              continuousLastSpeechAt = Date.now();
+              continuousRecorder?.start();
+            } else {
+              cleanupContinuousResources();
+            }
+          };
+
+          continuousRecorder.start();
+          scheduleContinuousMonitor();
+          setStatus('Continuous listening enabled. Speak naturally; silence will trigger responses.');
+        } catch (error) {
+          console.error('Failed to start continuous capture', error);
+          setContinuousIndicator(false);
+          setStatus('Continuous capture could not start. Check microphone permissions.');
+          cleanupContinuousResources();
+        }
+      }
+
+      async function stopContinuousCapture() {
+        if (!continuousRecorder && !continuousStream) {
+          setStatus('Continuous listening disabled.');
+          return;
+        }
+
+        try {
+          continuousMode = false;
+          setContinuousIndicator(false);
+
+          if (continuousRecorder && !continuousFinalizing) {
+            continuousFinalizing = true;
+            continuousRecorder.stop();
+            return;
+          }
+
+          cleanupContinuousResources();
+          setStatus('Continuous listening disabled.');
+        } catch (error) {
+          console.error('Failed to stop continuous capture', error);
+          cleanupContinuousResources();
+          setStatus('Continuous listening disabled.');
+        }
+      }
+
+      async function finalizeContinuousSegment() {
+        if (!continuousRecorder || continuousFinalizing) {
+          return;
+        }
+
+        continuousFinalizing = true;
+        continuousRecorder.stop();
+      }
+
+      async function processContinuousSegment(blob) {
+        try {
+          const arrayBuffer = await blob.arrayBuffer();
+          const base64Audio = Buffer.from(arrayBuffer).toString('base64');
+
+          const payload = {
+            audioBase64: base64Audio,
+            mimeType: blob.type || 'audio/webm',
+            history,
+            screenshotMode: 'primary',
+            mode: 'continuous',
+          };
+
+          const result = await ipcRenderer.invoke('voice:process', payload);
+          if (!result) {
+            throw new Error('Continuous voice processing failed');
+          }
+
+          if (result.transcript) {
+            history.push({ role: 'user', content: result.transcript });
+            appendMessage('user', `[Continuous] ${result.transcript}`);
+          }
+
+          if (result.responseText) {
+            history.push({ role: 'assistant', content: result.responseText });
+            appendMessage('assistant', result.responseText);
+          }
+
+          if (result.voiceBase64) {
+            const audio = new Audio(`data:audio/mpeg;base64,${result.voiceBase64}`);
+            audio.play().catch(() => {
+              console.warn('Failed to play continuous response audio');
+            });
+          }
+
+          if (Array.isArray(result.screenshots)) {
+            screenshotGrid.innerHTML = '';
+            for (const frame of result.screenshots) {
+              if (!frame?.dataUrl) {
+                continue;
+              }
+              const img = document.createElement('img');
+              img.src = frame.dataUrl;
+              img.alt = `Screenshot captured at ${frame.capturedAt ?? ''}`;
+              screenshotGrid.appendChild(img);
+            }
+
+            if (result.screenshots.length === 0) {
+              const empty = document.createElement('p');
+              empty.textContent = 'No screenshots captured for this request.';
+              empty.style.color = 'rgba(226, 232, 240, 0.65)';
+              screenshotGrid.appendChild(empty);
+            }
+          }
+
+          if (continuousMode) {
+            setStatus('Continuous listening active. Speak naturally; silence will trigger responses.');
+          } else {
+            setStatus('Continuous listening disabled.');
+          }
+        } catch (error) {
+          console.error('Continuous segment processing failed', error);
+          setStatus(error.message ?? 'Continuous mode encountered an error.');
+        }
+      }
+
+      recordBtn.addEventListener('click', () => {
+        void toggleRecording();
+      });
+
+      ipcRenderer.on('hud:interaction', (_event, enabled) => {
+        overlayInteractive = Boolean(enabled);
+
+        if (!isPttActive) {
+          hudInteractive = overlayInteractive;
+          recordBtn.disabled = !hudInteractive;
+          if (mediaRecorder?.state !== 'recording') {
+            setStatus(hudInteractive ? 'HUD active. Click the record button to talk.' : 'HUD passive. Press Shift + A to interact.');
+          }
+        }
+      });
+
+      ipcRenderer.on('hud:push-to-talk', (_event, payload) => {
+        const { mode = 'press', active = false, status } = payload ?? {};
+
+        if (typeof status === 'string') {
+          setStatus(status);
+        }
+
+        if (mode === 'continuous') {
+          handleContinuousToggle(active, status);
+          return;
+        }
+
+        handlePushToTalkToggle(Boolean(active), status);
+      });
+
+      ipcRenderer.on('hud:status', (_event, message) => {
+        if (typeof message === 'string' && message.length > 0) {
+          setStatus(message);
+        }
+      });
+
+      appendMessage('assistant', 'Press Shift + Z to start/stop talking. Press Shift + A to show or hide the overlay controls.');
+      setStatus('Idle. Press Shift + Z to speak.');
+    </script>
+  </body>
+</html>
